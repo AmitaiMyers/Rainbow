@@ -1,0 +1,83 @@
+rules_version = '2';
+
+// Rainbow Finder — see docs/SDD.md §8.
+// Size limits must match src/config/photos.ts (PHOTO.thumbMaxChars / PHOTO.fullMaxChars).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function photoPath(photoId) {
+      return /databases/$(database)/documents/photos/$(photoId);
+    }
+
+    function imagePath(photoId) {
+      return /databases/$(database)/documents/photoImages/$(photoId);
+    }
+
+    function reportPath(photoId, uid) {
+      return /databases/$(database)/documents/photos/$(photoId)/reports/$(uid);
+    }
+
+    function isJpegDataUrl(value, maxChars) {
+      return value is string
+        && value.size() <= maxChars
+        && value.matches('^data:image/jpeg;base64,[A-Za-z0-9+/=]+$');
+    }
+
+    function isValidNewPhoto(data) {
+      let fields = ['uid', 'authorName', 'authorPhoto', 'lat', 'lon', 'thumb', 'createdAt', 'reportCount'];
+      return data.keys().hasAll(fields) && data.keys().hasOnly(fields)
+        && data.uid == request.auth.uid
+        && data.authorName is string && data.authorName.size() <= 100
+        && data.authorPhoto is string && data.authorPhoto.size() <= 1000
+        && data.lat is number && data.lat >= -90 && data.lat <= 90
+        && data.lon is number && data.lon >= -180 && data.lon <= 180
+        && isJpegDataUrl(data.thumb, 40000)
+        && data.createdAt == request.time
+        && data.reportCount == 0;
+    }
+
+    match /photos/{photoId} {
+      allow read: if true;
+
+      // Created together with its full image in one batch.
+      allow create: if signedIn()
+        && isValidNewPhoto(request.resource.data)
+        && existsAfter(imagePath(photoId));
+
+      // The only allowed update is a report: +1, together with a new reports/{uid} doc.
+      allow update: if signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reportCount'])
+        && request.resource.data.reportCount == resource.data.reportCount + 1
+        && !exists(reportPath(photoId, request.auth.uid))
+        && existsAfter(reportPath(photoId, request.auth.uid));
+
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+
+      match /reports/{reporterUid} {
+        allow read: if signedIn() && reporterUid == request.auth.uid;
+        allow create: if signedIn()
+          && reporterUid == request.auth.uid
+          && request.resource.data.keys().hasOnly(['createdAt'])
+          && request.resource.data.createdAt == request.time
+          && getAfter(photoPath(photoId)).data.reportCount == get(photoPath(photoId)).data.reportCount + 1;
+      }
+    }
+
+    match /photoImages/{photoId} {
+      allow read: if true;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll(['uid', 'image'])
+        && request.resource.data.keys().hasOnly(['uid', 'image'])
+        && request.resource.data.uid == request.auth.uid
+        && isJpegDataUrl(request.resource.data.image, 450000)
+        && getAfter(photoPath(photoId)).data.uid == request.auth.uid;
+
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+  }
+}

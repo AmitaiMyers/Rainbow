@@ -1,6 +1,6 @@
 # Rainbow Finder — Software Design Document (POC)
 
-Status: **Draft for review**
+Status: **Approved — implemented**
 Scope: Proof of concept PWA
 
 ---
@@ -22,13 +22,15 @@ A Progressive Web App that:
 | Weather | Open-Meteo Forecast API (free, no key) |
 | Notifications | Client-side checks while the app is open. Local notifications through the Service Worker (`registration.showNotification`). No server push |
 | Trigger | Rainbow score ≥ 60 (0–100) within about 15 km, at most one notification per hour |
-| Auth | Google sign-in (Firebase Auth). Required to upload or report; **reading the feed is public** (see §10) |
+| Auth | Google sign-in (Firebase Auth). Required to upload or report; **reading the feed is public** (confirmed) |
 | Photo storage | Compressed JPEG stored as a base64 data URL in Firestore |
 | Photo location | Device GPS at the moment of capture, rounded to 2 decimals (about 1.1 km) |
 | Feed | Leaflet + OpenStreetMap world map with pins, plus a live list. Shows the last 24 h |
+| World layer | Rainbow chance for ~110 world cities on the map, light sampling (§4.4), cached 15 min |
 | Moderation | Firestore security rules plus a "Report" button. Hidden at 3 or more distinct reports |
 | Language / hosting | English UI, Firebase Hosting (HTTPS) |
 | Tests | Vitest unit tests for core logic |
+| Deploy | GitHub Actions on push to `main`: test → build → `firebase deploy --only hosting,firestore:rules` (see docs/DEPLOY.md) |
 
 ## 3. Architecture
 
@@ -62,10 +64,12 @@ A primary rainbow is visible when **all** of these hold:
 * `now`: current UTC time
 * Sun position (`lib/sun.ts`): elevation and azimuth from the NOAA solar position equations (pure function, unit-tested against known values).
 * Weather (`lib/weather.ts`): one Open-Meteo request for several coordinates:
-  * **Observer point** `(lat, lon)`: `cloud_cover`, `direct_radiation`, `precipitation`
-  * **9 antisolar sample points**: distances 3, 8 and 15 km × bearings `antisolar − 20°`, `antisolar`, `antisolar + 20°`: `precipitation` (mm, current 15-minute value)
-  * Endpoint: `https://api.open-meteo.com/v1/forecast?latitude=a,b,…&longitude=x,y,…&current=…` (one call, 10 locations).
-  * The exact variable availability under `current=` will be checked against the live API at the start of implementation. If `direct_radiation` is not available there, we use the `minutely_15` value for the current slot.
+  * **Observer point** `(lat, lon)`: `direct_radiation` (W/m², mean of the preceding 15 min)
+  * **9 antisolar sample points**: distances 3, 8 and 15 km × bearings `antisolar − 20°`, `antisolar`, `antisolar + 20°`: `precipitation` (mm, sum of the preceding 15 min)
+  * Endpoint: `https://api.open-meteo.com/v1/forecast?latitude=a,b,…&longitude=x,y,…&current=direct_radiation,precipitation` (one call, 10 locations).
+  * `cloud_cover` was dropped: `direct_radiation` already says whether the sun reaches the observer.
+  * The response is validated strictly (`parseWeatherResponse`): a missing or non-numeric value throws a clear error.
+  * **No weather call at all** when the sun factor is 0 (night, or sun ≥ 42°).
 
 ### 4.2 Factors (each 0..1)
 
@@ -77,14 +81,21 @@ sunFactor   = 0                      if h ≤ 0 or h ≥ 42
 
 clearFactor = clamp(direct_radiation / 200 W/m², 0, 1)      // the sun is actually shining on the observer
 
-rainFactor  = clamp(max(precipitation at the 9 antisolar points) / 0.5 mm, 0, 1)
+rainFactor  = clamp(max(precipitation at the 9 antisolar points) / 0.25 mm, 0, 1)   // 0.25 mm / 15 min ≈ 1 mm/h shower
 
 score       = round(100 × sunFactor × clearFactor × rainFactor)
 ```
 
-The thresholds (`5°`, `35°`, `200 W/m²`, `0.5 mm`, notify at `60`) live as named constants in one config module (`src/config/rainbow.ts`) so they can be tuned.
+The thresholds (`5°`, `35°`, `200 W/m²`, `0.25 mm`, notify at `60`) live as named constants in one config module (`src/config/rainbow.ts`) so they can be tuned.
 
-The score also returns the **direction to look** (antisolar azimuth as a compass bearing, e.g. "Look East-South-East"), which is shown in the UI and in the notification.
+The score also returns the **direction to look** (antisolar azimuth as a compass bearing, e.g. "Look ESE"), which is shown in the UI and in the notification.
+
+### 4.4 World layer
+
+* ~110 major cities (`src/data/cities.ts`), scored with the same code as the local score but a **light sampling plan**: the city itself + **1** rain point 8 km in the antisolar direction.
+* All cities go in **one** Open-Meteo request. Only cities with the sun in the 0–42° window are sampled, so a typical refresh asks for ~30–40 cities × 2 = 60–80 locations (the worst case is ~230).
+* Results are cached in memory for 15 minutes and refreshed every 15 minutes while the Map tab is open.
+* Map: a coloured circle per city (high ≥ 60 / medium ≥ 30 / low > 0 / none), sized by score, with a tooltip.
 
 ## 5. Notifications (Spark plan, no server)
 
@@ -149,34 +160,41 @@ vite.config.ts               # React + vite-plugin-pwa (manifest, icons, Workbox
 firebase.json                # Hosting (dist/) + Firestore rules/indexes
 firestore.rules
 firestore.indexes.json
-.env.example                 # VITE_FIREBASE_* placeholders
+.env.example                 # VITE_FIREBASE_* placeholders (4 keys)
 src/
-  main.tsx, App.tsx
-  config/firebase.ts         # init from import.meta.env (fails fast if a key is missing)
-  config/rainbow.ts          # tunable thresholds
-  lib/sun.ts                 # solar elevation/azimuth            (unit-tested)
-  lib/geo.ts                 # destination point, rounding, distance (unit-tested)
-  lib/rainbowScore.ts        # pure score + look-direction        (unit-tested)
-  lib/weather.ts             # Open-Meteo client + response validation
-  lib/image.ts               # resize/compress helpers            (unit-tested: size math)
-  lib/notify.ts              # permission + cooldown + showNotification
-  services/auth.ts           # Google sign-in/out
+  main.tsx, App.tsx, styles.css
+  config/rainbow.ts          # tunable thresholds + sampling plans (local / world)
+  config/photos.ts           # photo size limits, feed window (sizes mirrored in firestore.rules)
+  data/cities.ts             # ~110 world cities for the world layer
+  lib/math.ts, lib/geo.ts    # angles, destination point, distance, rounding, compass labels (unit-tested)
+  lib/sun.ts                 # NOAA solar elevation/azimuth                     (unit-tested)
+  lib/rainbowScore.ts        # pure factors + score + antisolar sample points     (unit-tested)
+  lib/rainbowForecast.ts     # many origins → one weather request → estimates     (unit-tested)
+  lib/weather.ts             # Open-Meteo URL + strict response parsing           (unit-tested)
+  lib/image.ts               # resize/compress to size limits                     (unit-tested: size math)
+  lib/notify.ts              # threshold + cooldown + showNotification            (unit-tested: shouldNotify)
+  lib/feed.ts, lib/time.ts   # 24 h / report filter, "x min ago"                  (unit-tested)
+  lib/location.ts            # one-shot GPS fix for photo capture
+  services/firebase.ts       # init from import.meta.env (fails fast if a key is missing)
+  services/auth.ts           # Google sign-in (popup in browser, redirect when installed)
   services/photos.ts         # upload batch, live feed, report, delete
-  hooks/useLocation.ts, useRainbowWatch.ts, usePhotoFeed.ts, useAuth.ts
-  components/ScoreCard.tsx, MapView.tsx, PhotoList.tsx, PhotoViewer.tsx,
-             CaptureButton.tsx, SignInButton.tsx
+  hooks/                     # useAuth, useLocation, useRainbowWatch, useWorldRainbow, usePhotoFeed, useNow
+  components/                # NowView, ScoreCard, AlertsButton, CaptureButton, MapView, FeedView,
+                             # PhotoCard, PhotoViewer, AuthButton
+public/sw-notification-click.js   # imported into the Workbox SW: focus/open app on notification tap
+.github/workflows/deploy.yml      # test → build → deploy on push to main
 ```
 
 **Screens (one page, bottom tab bar):** **Now** (score card, look-direction, enable-alerts button, "I see a rainbow!") · **Map** (world map with thumbnail pins) · **Feed** (live list, newest first, Report/Delete).
 
-## 10. Open questions (please confirm)
+## 10. Resolved questions
 
-1. **"Calculate the weather in the world":** this design calculates the rainbow chance **only around the user**, and the world view comes from user photos. Do you also want a global "rainbow chance" layer on the map (for example, a score for ~100 major cities refreshed when the map opens)? It's extra Open-Meteo load but still free.
-2. **Public feed:** is it OK that anyone can **view** photos without signing in (sign-in needed only to upload or report)?
-3. **Firebase config:** please send the web app config (`apiKey`, `authDomain`, `projectId`, `appId`, `messagingSenderId`; `storageBucket` isn't needed). Also confirm that **Google** is enabled under Authentication → Sign-in method, and that the Hosting domain (`<project>.web.app`) is in Authorized domains.
+1. **World weather:** yes — a world "rainbow chance" layer for ~110 cities, light sampling (§4.4).
+2. **Public feed:** yes — anyone can view; sign-in only to upload or report.
+3. **Firebase config:** provided through GitHub repository secrets at deploy time (`apiKey`, `authDomain`, `projectId`, `appId`). `messagingSenderId` and `storageBucket` are not needed.
 
 ## 11. Risks
 
-* **Google sign-in in an installed iOS PWA:** popups can fail in standalone mode. We use `signInWithPopup` and fall back to `signInWithRedirect`; for the redirect to work, `authDomain` should be set to the Hosting domain.
+* **Google sign-in in an installed iOS PWA:** popups can fail in standalone mode, so the installed app (`display-mode: standalone`) uses `signInWithRedirect` and the browser uses `signInWithPopup`. For the redirect to work, `authDomain` is set to the Hosting domain (`<project>.web.app`) and its `/__/auth/handler` is an authorized redirect URI (docs/DEPLOY.md, Step 3).
 * **OpenStreetMap tile policy:** acceptable for low POC traffic, and attribution is shown. A production version would need a tile provider.
 * **Score accuracy:** model weather is coarse (km grid, 15-minute steps), so the score is a "likelihood" hint, not a guarantee.
